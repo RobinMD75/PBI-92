@@ -1,0 +1,186 @@
+# Installation des dépendances (à exécuter en premier)
+!pip install requests beautifulsoup4 pandas openpyxl lxml
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import re
+import time
+from urllib.parse import urljoin, unquote
+import urllib.request
+from IPython.display import display
+
+class ParisTransitIconScraper:
+    def __init__(self):
+        self.base_url = "https://commons.wikimedia.org"
+        self.search_url = "https://commons.wikimedia.org/w/api.php"
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        
+    def search_paris_transit_files(self):
+        """Recherche tous les fichiers 'Paris transit icons' via l'API MediaWiki"""
+        params = {
+            'action': 'query',
+            'format': 'json',
+            'list': 'search',
+            'srsearch': 'Paris transit icons',
+            'srnamespace': '6',  # Namespace for files
+            'srlimit': '500'
+        }
+        
+        try:
+            response = self.session.get(self.search_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            files = []
+            if 'query' in data and 'search' in data['query']:
+                for item in data['query']['search']:
+                    title = item['title']
+                    if 'Paris transit icons' in title:
+                        files.append(title)
+            
+            return files
+            
+        except Exception as e:
+            print(f"Erreur lors de la recherche : {e}")
+            return []
+    
+    def get_file_info(self, file_title):
+        """Récupère les informations d'un fichier spécifique"""
+        params = {
+            'action': 'query',
+            'format': 'json',
+            'titles': file_title,
+            'prop': 'imageinfo',
+            'iiprop': 'url|size|mime'
+        }
+        
+        try:
+            response = self.session.get(self.search_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'query' in data and 'pages' in data['query']:
+                page = list(data['query']['pages'].values())[0]
+                if 'imageinfo' in page and len(page['imageinfo']) > 0:
+                    return page['imageinfo'][0]
+            
+            return None
+            
+        except Exception as e:
+            print(f"Erreur pour le fichier {file_title}: {e}")
+            return None
+    
+    def parse_transport_name(self, filename):
+        """Extrait le nom du transport depuis le nom de fichier"""
+        # Enlever le préfixe et l'extension
+        name = filename.replace('Fichier:', '').replace('File:', '')
+        name = re.sub(r'Paris transit icons - ', '', name)
+        name = re.sub(r'\.(svg|png|jpg)$', '', name, flags=re.IGNORECASE)
+        
+        # Décoder les caractères URL
+        name = unquote(name)
+        
+        return name.strip()
+    
+    def scrape_icons(self):
+        """Fonction principale pour extraire toutes les icônes"""
+        print("🔍 Recherche des fichiers Paris transit icons...")
+        files = self.search_paris_transit_files()
+        
+        if not files:
+            print("❌ Aucun fichier trouvé")
+            return pd.DataFrame()
+        
+        print(f"✅ {len(files)} fichiers trouvés")
+        
+        icons_data = []
+        
+        for i, file_title in enumerate(files):
+            print(f"📥 Traitement {i+1}/{len(files)}: {file_title}")
+            
+            # Récupérer les infos du fichier
+            file_info = self.get_file_info(file_title)
+            
+            if file_info and 'url' in file_info:
+                transport_name = self.parse_transport_name(file_title)
+                
+                # Construire l'URL de la page du fichier
+                page_url = f"{self.base_url}/wiki/{file_title.replace(' ', '_')}"
+                
+                icons_data.append({
+                    'Nom du transport': transport_name,
+                    'Nom du fichier': file_title,
+                    'URL de l\'image': file_info['url'],
+                    'URL de la page': page_url,
+                    'Taille': f"{file_info.get('width', 'N/A')}x{file_info.get('height', 'N/A')}",
+                    'Type MIME': file_info.get('mime', 'N/A')
+                })
+            
+            # Pause pour éviter de surcharger le serveur
+            time.sleep(0.5)
+        
+        df = pd.DataFrame(icons_data)
+        return df
+
+def main():
+    print("🚇 Extracteur d'icônes Paris Transit Icons")
+    print("=" * 50)
+    
+    scraper = ParisTransitIconScraper()
+    
+    # Scraper les icônes
+    df = scraper.scrape_icons()
+    
+    if df.empty:
+        print("❌ Aucune donnée récupérée")
+        return
+    
+    # Trier par nom de transport
+    df = df.sort_values('Nom du transport').reset_index(drop=True)
+    
+    # Afficher un aperçu
+    print(f"\n✅ {len(df)} icônes récupérées avec succès!")
+    print("\n📋 Aperçu des données:")
+    display(df.head(10))
+    
+    # Sauvegarder en Excel
+    excel_filename = 'paris_transit_icons.xlsx'
+    
+    try:
+        df.to_excel(excel_filename, index=False, engine='openpyxl')
+        print(f"\n💾 Fichier Excel sauvegardé: {excel_filename}")
+        
+        # Télécharger le fichier (Google Colab)
+        from google.colab import files
+        files.download(excel_filename)
+        print("📥 Téléchargement automatique du fichier lancé!")
+        
+    except Exception as e:
+        print(f"❌ Erreur lors de la sauvegarde: {e}")
+    
+    # Sauvegarder aussi en CSV pour backup
+    try:
+        csv_filename = 'paris_transit_icons.csv'
+        df.to_csv(csv_filename, index=False, encoding='utf-8')
+        print(f"💾 Fichier CSV sauvegardé: {csv_filename}")
+    except Exception as e:
+        print(f"⚠️ Erreur CSV: {e}")
+    
+    # Statistiques
+    print(f"\n📊 Statistiques:")
+    print(f"Total des icônes: {len(df)}")
+    
+    transport_types = df['Nom du transport'].str.extract(r'^([A-Za-z]+)')[0].value_counts()
+    print("\n🚊 Types de transport:")
+    for transport, count in transport_types.items():
+        print(f"  - {transport}: {count}")
+    
+    return df
+
+# Lancer le scraping
+if __name__ == "__main__":
+    df_result = main()
