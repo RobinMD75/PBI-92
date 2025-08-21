@@ -1,0 +1,653 @@
+import requests
+import pandas as pd
+import json
+from datetime import datetime
+import os
+
+class INSEEDataExtractor:
+    def __init__(self, consumer_key=None, consumer_secret=None):
+        """
+        Initialise l'extracteur de données INSEE
+
+        Args:
+            consumer_key (str): Clé d'API INSEE (optionnel)
+            consumer_secret (str): Secret d'API INSEE (optionnel)
+        """
+        self.base_url = "https://api.insee.fr/melodi/data/DS_RP_POPULATION_PRINC"
+        self.session = requests.Session()
+
+        # Configuration des headers
+        self.session.headers.update({
+            'User-Agent': 'Python INSEE Data Extractor',
+            'Accept': 'application/json'
+        })
+
+        # Si des clés API sont fournies, les configurer
+        if consumer_key and consumer_secret:
+            self.setup_auth(consumer_key, consumer_secret)
+
+    def setup_auth(self, consumer_key, consumer_secret):
+        """Configure l'authentification OAuth2 pour l'API INSEE"""
+        try:
+            # URL pour obtenir le token
+            token_url = "https://api.insee.fr/token"
+
+            # Données pour la requête de token
+            token_data = {
+                'grant_type': 'client_credentials'
+            }
+
+            # Requête pour obtenir le token
+            response = requests.post(
+                token_url,
+                data=token_data,
+                auth=(consumer_key, consumer_secret)
+            )
+
+            if response.status_code == 200:
+                token_info = response.json()
+                access_token = token_info.get('access_token')
+
+                # Ajouter le token aux headers
+                self.session.headers.update({
+                    'Authorization': f'Bearer {access_token}'
+                })
+                print("✅ Authentification réussie")
+            else:
+                print(f"❌ Erreur d'authentification: {response.status_code}")
+
+        except Exception as e:
+            print(f"❌ Erreur lors de l'authentification: {e}")
+
+    def get_data_from_api(self, geo_code):
+        """
+        Récupère les données depuis l'API INSEE pour un code géographique donné
+
+        Args:
+            geo_code (str): Code géographique (ex: 2025-COM-92004)
+
+        Returns:
+            dict: Données JSON ou None en cas d'erreur
+        """
+        try:
+            url = f"{self.base_url}?GEO={geo_code}"
+            print(f"📡 Récupération des données pour {geo_code}...")
+
+            response = self.session.get(url)
+
+            if response.status_code == 200:
+                print(f"✅ Données récupérées avec succès pour {geo_code}")
+                return response.json()
+            else:
+                print(f"❌ Erreur {response.status_code} pour {geo_code}: {response.text}")
+                return None
+
+        except Exception as e:
+            print(f"❌ Erreur lors de la récupération pour {geo_code}: {e}")
+            return None
+
+    def json_to_dataframe(self, data, geo_code):
+        """
+        Convertit les données JSON en DataFrame pandas
+
+        Args:
+            data (dict): Données JSON de l'API ou liste directe
+            geo_code (str): Code géographique
+
+        Returns:
+            pandas.DataFrame: DataFrame avec les données aplaties
+        """
+        try:
+            # Déterminer si data est une liste ou un dict
+            if isinstance(data, list):
+                # Cas où data est directement une liste d'objets
+                json_data = data
+            elif isinstance(data, dict) and 'data' in data:
+                # Cas où les données sont dans une structure 'data'
+                json_data = data['data']
+            else:
+                # Cas où data est un dict mais pas dans la structure attendue
+                json_data = [data]
+
+            records = []
+
+            # Traiter chaque élément
+            for item in json_data:
+                # Créer un enregistrement aplati
+                record = {
+                    'geo_code': geo_code,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+
+                # Traitement spécifique pour la structure INSEE avec dimensions et measures
+                if 'dimensions' in item and 'measures' in item:
+                    # Aplatir les dimensions
+                    dimensions = item['dimensions']
+                    for dim_key, dim_value in dimensions.items():
+                        record[f'dim_{dim_key}'] = dim_value
+
+                    # Aplatir les mesures
+                    measures = item['measures']
+                    for measure_key, measure_data in measures.items():
+                        if isinstance(measure_data, dict) and 'value' in measure_data:
+                            record[f'measure_{measure_key}'] = measure_data['value']
+                        else:
+                            record[f'measure_{measure_key}'] = measure_data
+                else:
+                    # Structure générique - aplatir directement
+                    record.update(item)
+
+                records.append(record)
+
+            df = pd.DataFrame(records)
+
+            # Réorganiser les colonnes pour une meilleure lisibilité
+            if not df.empty:
+                # Colonnes d'identification en premier
+                id_cols = ['geo_code', 'timestamp']
+
+                # Colonnes de dimensions
+                dim_cols = [col for col in df.columns if col.startswith('dim_')]
+
+                # Colonnes de mesures
+                measure_cols = [col for col in df.columns if col.startswith('measure_')]
+
+                # Autres colonnes
+                other_cols = [col for col in df.columns if col not in id_cols + dim_cols + measure_cols]
+
+                # Réordonner
+                new_order = id_cols + dim_cols + measure_cols + other_cols
+                df = df.reindex(columns=new_order)
+
+            return df
+
+        except Exception as e:
+            print(f"❌ Erreur lors de la conversion en DataFrame pour {geo_code}: {e}")
+            print(f"📄 Structure des données reçues: {type(data)}")
+            if isinstance(data, (list, dict)) and len(str(data)) < 500:
+                print(f"📋 Aperçu des données: {data}")
+            return pd.DataFrame()
+
+    def save_to_json(self, dataframes, filename=None):
+        """
+        Sauvegarde les DataFrames en fichier JSON
+
+        Args:
+            dataframes (dict): Dictionnaire {geo_code: DataFrame}
+            filename (str): Nom du fichier (optionnel)
+        """
+        try:
+            if not filename:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f"donnees_insee_{timestamp}.json"
+
+            # Créer le dossier de sortie s'il n'existe pas
+            output_dir = "output"
+            os.makedirs(output_dir, exist_ok=True)
+            filepath = os.path.join(output_dir, filename)
+
+            # Préparer les données pour JSON
+            json_data = {}
+
+            for geo_code, df in dataframes.items():
+                if not df.empty:
+                    # Nettoyer le DataFrame
+                    df_clean = df.copy()
+
+                    # Renommer les colonnes pour plus de clarté
+                    column_mapping = {
+                        'dim_GEO': 'code_geo',
+                        'dim_SEX': 'sexe',
+                        'dim_TIME_PERIOD': 'annee',
+                        'dim_RP_MEASURE': 'type_mesure',
+                        'dim_AGE': 'tranche_age',
+                        'measure_OBS_VALUE_NIVEAU': 'population'
+                    }
+
+                    df_clean.rename(columns=column_mapping, inplace=True)
+
+                    # Traduire les valeurs pour plus de lisibilité
+                    if 'sexe' in df_clean.columns:
+                        sex_mapping = {'M': 'masculin', 'F': 'feminin', '_T': 'total'}
+                        df_clean['sexe'] = df_clean['sexe'].map(sex_mapping).fillna(df_clean['sexe'])
+
+                    if 'tranche_age' in df_clean.columns:
+                        age_mapping = {
+                            '_T': 'total',
+                            'Y_LT15': 'moins_de_15_ans',
+                            'Y15T24': '15_a_24_ans',
+                            'Y20T64': '20_a_64_ans',
+                            'Y25T39': '25_a_39_ans',
+                            'Y40T54': '40_a_54_ans',
+                            'Y55T64': '55_a_64_ans',
+                            'Y_GE65': '65_ans_et_plus',
+                            'Y65T79': '65_a_79_ans',
+                            'Y_GE80': '80_ans_et_plus',
+                            'Y_LT20': 'moins_de_20_ans'
+                        }
+                        df_clean['tranche_age'] = df_clean['tranche_age'].map(age_mapping).fillna(df_clean['tranche_age'])
+
+                    # Arrondir les valeurs de population
+                    if 'population' in df_clean.columns:
+                        df_clean['population'] = df_clean['population'].round(0).astype(int)
+
+                    # Trier les données
+                    sort_cols = [col for col in ['annee', 'sexe', 'tranche_age'] if col in df_clean.columns]
+                    if sort_cols:
+                        df_clean = df_clean.sort_values(sort_cols)
+
+                    # Convertir en liste de dictionnaires
+                    json_data[geo_code] = df_clean.to_dict('records')
+                    print(f"✅ Données préparées pour '{geo_code}' avec {len(df_clean)} enregistrements")
+
+            # Créer aussi une version consolidée si plusieurs DataFrames
+            if len(dataframes) > 1:
+                consolidated_records = []
+                for geo_code, records in json_data.items():
+                    consolidated_records.extend(records)
+
+                # Trier la version consolidée
+                consolidated_records.sort(key=lambda x: (
+                    x.get('code_geo', ''),
+                    x.get('annee', ''),
+                    x.get('sexe', ''),
+                    x.get('tranche_age', '')
+                ))
+
+                json_data['consolidated'] = consolidated_records
+                print(f"✅ Version consolidée créée avec {len(consolidated_records)} enregistrements")
+
+            # Sauvegarder en JSON
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(json_data, f, ensure_ascii=False, indent=2)
+
+            print(f"📄 Fichier JSON sauvegardé: {filepath}")
+
+            # Afficher un aperçu de la structure
+            print(f"\n📋 Structure du fichier JSON:")
+            for key, value in json_data.items():
+                if isinstance(value, list):
+                    print(f"  - '{key}': {len(value)} enregistrements")
+
+            return filepath
+
+        except Exception as e:
+            print(f"❌ Erreur lors de la sauvegarde JSON: {e}")
+            return None
+
+    def save_to_excel(self, dataframes, filename=None):
+        """
+        Sauvegarde les DataFrames en fichier Excel avec mise en forme
+
+        Args:
+            dataframes (dict): Dictionnaire {geo_code: DataFrame}
+            filename (str): Nom du fichier (optionnel)
+        """
+        try:
+            if not filename:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f"donnees_insee_{timestamp}.xlsx"
+
+            # Créer le dossier de sortie s'il n'existe pas
+            output_dir = "output"
+            os.makedirs(output_dir, exist_ok=True)
+            filepath = os.path.join(output_dir, filename)
+
+            with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+                # Créer une feuille par code géographique
+                for geo_code, df in dataframes.items():
+                    if not df.empty:
+                        # Nettoyer le nom de la feuille (max 31 caractères pour Excel)
+                        sheet_name = geo_code.replace('2025-COM-', 'COM_')[:31]
+
+                        # Créer une copie du DataFrame pour renommer les colonnes
+                        df_clean = df.copy()
+
+                        # Renommer les colonnes pour plus de clarté
+                        column_mapping = {
+                            'dim_GEO': 'Code_Geo',
+                            'dim_SEX': 'Sexe',
+                            'dim_TIME_PERIOD': 'Annee',
+                            'dim_RP_MEASURE': 'Type_Mesure',
+                            'dim_AGE': 'Tranche_Age',
+                            'measure_OBS_VALUE_NIVEAU': 'Population'
+                        }
+
+                        df_clean.rename(columns=column_mapping, inplace=True)
+
+                        # Traduire les valeurs pour plus de lisibilité
+                        if 'Sexe' in df_clean.columns:
+                            sex_mapping = {'M': 'Masculin', 'F': 'Féminin', '_T': 'Total'}
+                            df_clean['Sexe'] = df_clean['Sexe'].map(sex_mapping).fillna(df_clean['Sexe'])
+
+                        if 'Tranche_Age' in df_clean.columns:
+                            age_mapping = {
+                                '_T': 'Total',
+                                'Y_LT15': 'Moins de 15 ans',
+                                'Y15T24': '15 à 24 ans',
+                                'Y20T64': '20 à 64 ans',
+                                'Y25T39': '25 à 39 ans',
+                                'Y40T54': '40 à 54 ans',
+                                'Y55T64': '55 à 64 ans',
+                                'Y_GE65': '65 ans et plus',
+                                'Y65T79': '65 à 79 ans',
+                                'Y_GE80': '80 ans et plus',
+                                'Y_LT20': 'Moins de 20 ans'
+                            }
+                            df_clean['Tranche_Age'] = df_clean['Tranche_Age'].map(age_mapping).fillna(df_clean['Tranche_Age'])
+
+                        # Arrondir les valeurs de population
+                        if 'Population' in df_clean.columns:
+                            df_clean['Population'] = df_clean['Population'].round(0).astype(int)
+
+                        # Trier les données par année, sexe, tranche d'âge
+                        sort_cols = [col for col in ['Annee', 'Sexe', 'Tranche_Age'] if col in df_clean.columns]
+                        if sort_cols:
+                            df_clean = df_clean.sort_values(sort_cols)
+
+                        # Sauvegarder dans Excel
+                        df_clean.to_excel(writer, sheet_name=sheet_name, index=False)
+                        print(f"✅ Feuille '{sheet_name}' créée avec {len(df_clean)} lignes")
+
+                        # Mise en forme de la feuille
+                        worksheet = writer.sheets[sheet_name]
+
+                        # Ajuster la largeur des colonnes
+                        for column in worksheet.columns:
+                            max_length = 0
+                            column_letter = column[0].column_letter
+
+                            for cell in column:
+                                try:
+                                    if len(str(cell.value)) > max_length:
+                                        max_length = len(str(cell.value))
+                                except:
+                                    pass
+
+                            adjusted_width = min(max_length + 2, 30)
+                            worksheet.column_dimensions[column_letter].width = adjusted_width
+
+                # Créer une feuille consolidée si plusieurs DataFrames
+                if len(dataframes) > 1:
+                    # Préparer les DataFrames nettoyés pour la consolidation
+                    cleaned_dfs = []
+                    for geo_code, df in dataframes.items():
+                        if not df.empty:
+                            df_clean = df.copy()
+
+                            # Appliquer les mêmes transformations
+                            column_mapping = {
+                                'dim_GEO': 'Code_Geo',
+                                'dim_SEX': 'Sexe',
+                                'dim_TIME_PERIOD': 'Annee',
+                                'dim_RP_MEASURE': 'Type_Mesure',
+                                'dim_AGE': 'Tranche_Age',
+                                'measure_OBS_VALUE_NIVEAU': 'Population'
+                            }
+                            df_clean.rename(columns=column_mapping, inplace=True)
+
+                            if 'Sexe' in df_clean.columns:
+                                sex_mapping = {'M': 'Masculin', 'F': 'Féminin', '_T': 'Total'}
+                                df_clean['Sexe'] = df_clean['Sexe'].map(sex_mapping).fillna(df_clean['Sexe'])
+
+                            if 'Tranche_Age' in df_clean.columns:
+                                age_mapping = {
+                                    '_T': 'Total',
+                                    'Y_LT15': 'Moins de 15 ans',
+                                    'Y15T24': '15 à 24 ans',
+                                    'Y20T64': '20 à 64 ans',
+                                    'Y25T39': '25 à 39 ans',
+                                    'Y40T54': '40 à 54 ans',
+                                    'Y55T64': '55 à 64 ans',
+                                    'Y_GE65': '65 ans et plus',
+                                    'Y65T79': '65 à 79 ans',
+                                    'Y_GE80': '80 ans et plus',
+                                    'Y_LT20': 'Moins de 20 ans'
+                                }
+                                df_clean['Tranche_Age'] = df_clean['Tranche_Age'].map(age_mapping).fillna(df_clean['Tranche_Age'])
+
+                            if 'Population' in df_clean.columns:
+                                df_clean['Population'] = df_clean['Population'].round(0).astype(int)
+
+                            cleaned_dfs.append(df_clean)
+
+                    consolidated_df = pd.concat(cleaned_dfs, ignore_index=True)
+
+                    # Trier la feuille consolidée
+                    sort_cols = [col for col in ['Code_Geo', 'Annee', 'Sexe', 'Tranche_Age'] if col in consolidated_df.columns]
+                    if sort_cols:
+                        consolidated_df = consolidated_df.sort_values(sort_cols)
+
+                    consolidated_df.to_excel(writer, sheet_name='Consolidated', index=False)
+                    print(f"✅ Feuille 'Consolidated' créée avec {len(consolidated_df)} lignes")
+
+                    # Mise en forme de la feuille consolidée
+                    worksheet = writer.sheets['Consolidated']
+                    for column in worksheet.columns:
+                        max_length = 0
+                        column_letter = column[0].column_letter
+
+                        for cell in column:
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(str(cell.value))
+                            except:
+                                pass
+
+                        adjusted_width = min(max_length + 2, 30)
+                        worksheet.column_dimensions[column_letter].width = adjusted_width
+
+            print(f"📊 Fichier Excel sauvegardé: {filepath}")
+            return filepath
+
+        except Exception as e:
+            print(f"❌ Erreur lors de la sauvegarde Excel: {e}")
+            return None
+
+    def extract_data_for_codes(self, geo_codes, filename=None, format='json'):
+        """
+        Méthode principale pour extraire les données pour plusieurs codes géographiques
+
+        Args:
+            geo_codes (list): Liste des codes géographiques
+            filename (str): Nom du fichier (optionnel)
+            format (str): Format de sortie ('json' ou 'excel')
+
+        Returns:
+            str: Chemin du fichier créé
+        """
+        dataframes = {}
+
+        print(f"🚀 Début de l'extraction pour {len(geo_codes)} codes géographiques")
+
+        for geo_code in geo_codes:
+            # Récupérer les données
+            data = self.get_data_from_api(geo_code)
+
+            if data:
+                # Convertir en DataFrame
+                df = self.json_to_dataframe(data, geo_code)
+
+                if not df.empty:
+                    dataframes[geo_code] = df
+                    print(f"✅ {len(df)} enregistrements traités pour {geo_code}")
+                else:
+                    print(f"⚠️  Aucune donnée convertible pour {geo_code}")
+            else:
+                print(f"⚠️  Aucune donnée récupérée pour {geo_code}")
+
+        # Sauvegarder selon le format demandé
+        if dataframes:
+            if format.lower() == 'json':
+                filepath = self.save_to_json(dataframes, filename)
+            else:
+                filepath = self.save_to_excel(dataframes, filename)
+
+            print(f"🎉 Extraction terminée ! Total: {len(dataframes)} jeux de données")
+            return filepath
+        else:
+            print("❌ Aucune donnée à sauvegarder")
+            return None
+
+
+def test_with_sample_data():
+    """Fonction de test avec les données d'exemple fournies"""
+    import json
+
+    # Données d'exemple fournies par l'utilisateur (extrait)
+    sample_data = [
+        {
+            'dimensions': {'GEO': '2025-COM-92004', 'SEX': 'M', 'TIME_PERIOD': '2011', 'RP_MEASURE': 'POP', 'AGE': 'Y_GE65'},
+            'measures': {'OBS_VALUE_NIVEAU': {'value': 3752.16712513379}}
+        },
+        {
+            'dimensions': {'GEO': '2025-COM-92004', 'SEX': 'F', 'TIME_PERIOD': '2011', 'RP_MEASURE': 'POP', 'AGE': 'Y_GE65'},
+            'measures': {'OBS_VALUE_NIVEAU': {'value': 5477.07170930752}}
+        },
+        {
+            'dimensions': {'GEO': '2025-COM-92004', 'SEX': '_T', 'TIME_PERIOD': '2011', 'RP_MEASURE': 'POP', 'AGE': '_T'},
+            'measures': {'OBS_VALUE_NIVEAU': {'value': 83376.0}}
+        }
+    ]
+
+    print("🧪 Test avec les données d'exemple...")
+
+    # Créer l'extracteur
+    extractor = INSEEDataExtractor()
+
+    # Convertir les données d'exemple
+    df = extractor.json_to_dataframe(sample_data, "2025-COM-92004")
+
+    if not df.empty:
+        print(f"✅ Conversion réussie: {len(df)} lignes")
+        print("\n📋 Aperçu des colonnes:")
+        for col in df.columns:
+            print(f"  - {col}")
+
+        print(f"\n📊 Aperçu des 3 premières lignes:")
+        print(df.head(3).to_string())
+
+        # Test de sauvegarde en JSON
+        dataframes = {"2025-COM-92004": df}
+        filepath = extractor.save_to_json(dataframes, "test_donnees_insee.json")
+
+        if filepath:
+            print(f"\n🎉 Test terminé avec succès !")
+            print(f"📁 Fichier test JSON disponible: {filepath}")
+
+            # Afficher un aperçu du JSON créé
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                print(f"\n📄 Aperçu du JSON créé:")
+                for key, value in data.items():
+                    if isinstance(value, list) and len(value) > 0:
+                        print(f"  {key}: {len(value)} enregistrement(s)")
+                        print(f"    Premier enregistrement: {json.dumps(value[0], ensure_ascii=False, indent=4)}")
+        else:
+            print("\n❌ Erreur lors de la sauvegarde du test")
+    else:
+        print("❌ Erreur lors de la conversion des données d'exemple")
+
+
+def main():
+    """Fonction principale"""
+    print("🚀 Script de récupération des données INSEE")
+    print("=" * 50)
+
+    # Demander à l'utilisateur s'il veut faire le test ou l'extraction complète
+    print("\nOptions disponibles:")
+    print("1. Test avec données d'exemple (recommandé en premier)")
+    print("2. Extraction complète depuis l'API INSEE (format JSON)")
+    print("3. Extraction complète depuis l'API INSEE (format Excel)")
+
+    choice = input("\nChoisissez une option (1, 2 ou 3): ").strip()
+
+    if choice == "1":
+        test_with_sample_data()
+    elif choice in ["2", "3"]:
+        # Codes géographiques à traiter
+        geo_codes = [
+            "2025-COM-92002",  
+            "2025-COM-92004",  
+            "2025-COM-92007",
+            "2025-COM-92009",
+            "2025-COM-92012",
+            "2025-COM-92014",
+            "2025-COM-92019",
+            "2025-COM-92020",
+            "2025-COM-92022",
+            "2025-COM-92023",
+            "2025-COM-92024",
+            "2025-COM-92025",
+            "2025-COM-92026",
+            "2025-COM-92032",
+            "2025-COM-92033",
+            "2025-COM-92035",
+            "2025-COM-92036",
+            "2025-COM-92040",
+            "2025-COM-92044",
+            "2025-COM-92046",
+            "2025-COM-92048",
+            "2025-COM-92049",
+            "2025-COM-92050",
+            "2025-COM-92051",
+            "2025-COM-92060",
+            "2025-COM-92062",
+            "2025-COM-92063",
+            "2025-COM-92064",
+            "2025-COM-92071",
+            "2025-COM-92072",
+            "2025-COM-92073",
+            "2025-COM-92075",
+            "2025-COM-92076"
+            "2025-COM-92077"
+            "2025-COM-92078"
+    ]        
+
+        # Créer l'extracteur
+        # Si vous avez des clés API INSEE, décommentez et remplissez:
+        # extractor = INSEEDataExtractor(
+        #     consumer_key="VOTRE_CLE_API",
+        #     consumer_secret="VOTRE_SECRET_API"
+        # )
+
+        extractor = INSEEDataExtractor()
+
+        # Définir le format et le nom de fichier
+        if choice == "2":
+            format_type = 'json'
+            filename = "donnees_population_hauts_de_seine.json"
+        else:
+            format_type = 'excel'
+            filename = "donnees_population_hauts_de_seine.xlsx"
+
+        # Extraire les données
+        result_file = extractor.extract_data_for_codes(
+            geo_codes=geo_codes,
+            filename=filename,
+            format=format_type
+        )
+
+        if result_file:
+            print(f"\n📁 Fichier disponible: {result_file}")
+            print(f"\n📋 Contenu du fichier {format_type.upper()}:")
+            if format_type == 'json':
+                print("- Structure JSON avec clés par commune")
+                print("- Section 'consolidated' avec toutes les données")
+                print("- Colonnes traduites en français (camelCase)")
+                print("- Valeurs de population arrondies")
+                print("- Données triées par année, sexe et tranche d'âge")
+            else:
+                print("- Une feuille par commune avec ses données traduites")
+                print("- Une feuille 'Consolidated' avec toutes les données")
+                print("- Colonnes traduites en français")
+                print("- Valeurs de population arrondies")
+                print("- Données triées par année, sexe et tranche d'âge")
+        else:
+            print("\n❌ Aucun fichier n'a été généré")
+    else:
+        print("❌ Option non valide. Choisissez 1, 2 ou 3.")
+
+
+if __name__ == "__main__":
+    main()
